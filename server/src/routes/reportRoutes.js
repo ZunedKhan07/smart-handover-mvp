@@ -1,12 +1,9 @@
-import express from 'express';
-import { getReportById, updateReportApproval } from '../controllers/report.controller.js';
+import { Router } from 'express';
+import { getReport, approveReport, updateReport } from '../controllers/reportController.js';
 
-const router = express.Router();
-
-// GET: /api/reports/:id
-router.get('/:id', getReportById);
-
-// PATCH: /api/reports/:id/approval
-router.patch('/:id/approval', updateReportApproval);
+const router = Router();
+router.get('/:id', getReport);
+router.patch('/:id/approve', approveReport);
+router.patch('/:id', updateReport);
 
 export default router;

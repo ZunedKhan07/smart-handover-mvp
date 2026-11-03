@@ -1,163 +1,146 @@
 import { Octokit } from '@octokit/rest';
-import { ErrorHandler } from '../utils/errorHandler.js';
-
-const octokit = new Octokit({
-    auth: process.env.GITHUB_TOKEN || undefined,
-    userAgent: 'AI-Project-Handover-System',
-    timeZone: 'UTC'
-});
+import { AppError } from '../utils/errorHandler.js';
 
 const MAX_COMMITS = 100;
-const MAX_FILES = 1000;
+let octokit;
+const getOctokit = () =>
+  (octokit ??= new Octokit({
+    auth: process.env.GITHUB_TOKEN || undefined,
+    userAgent: 'smart-handover-mvp',
+  }));
 
-const extractRepoDetails = (repoUrl) => {
-    if (typeof repoUrl !== 'string' || !repoUrl.trim()) {
-        throw new ErrorHandler('GitHub repository URL is required.', 400);
-    }
-
-    let url;
-
-    try {
-        url = new URL(repoUrl.trim());
-    } catch {
-        throw new ErrorHandler('Invalid GitHub repository URL.', 400);
-    }
-
-    if (
-        url.protocol !== 'https:' ||
-        !['github.com', 'www.github.com'].includes(url.hostname)
-    ) {
-        throw new ErrorHandler('Only valid HTTPS GitHub URLs are supported.', 400);
-    }
-
-    const parts = url.pathname
-        .replace(/\/+$/, '')
-        .replace(/\.git$/i, '')
-        .split('/')
-        .filter(Boolean);
-
-    if (parts.length !== 2) {
-        throw new ErrorHandler(
-            'Invalid repository URL. Expected: github.com/owner/repo',
-            400
-        );
-    }
-
-    const [owner, repoName] = parts;
-
-    if (
-        !/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(owner) ||
-        !/^[a-zA-Z0-9._-]+$/.test(repoName)
-    ) {
-        throw new ErrorHandler('Invalid GitHub owner or repository name.', 400);
-    }
-
-    return { owner, repoName };
+export const parseRepoUrl = (input) => {
+  if (typeof input !== 'string' || !input.trim()) {
+    throw new AppError('A GitHub repository URL is required.', 400);
+  }
+  let value = input.trim();
+  if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new AppError('That does not look like a valid URL.', 400);
+  }
+  if (!['github.com', 'www.github.com'].includes(url.hostname.toLowerCase())) {
+    throw new AppError('Only github.com repository URLs are supported.', 400);
+  }
+  const [owner, rawName] = url.pathname.split('/').filter(Boolean);
+  const name = rawName?.replace(/\.git$/i, '');
+  const valid = (s) => s && /^[A-Za-z0-9_.-]{1,100}$/.test(s) && s !== '.' && s !== '..';
+  if (!valid(owner) || !valid(name)) {
+    throw new AppError('Use the format https://github.com/owner/repository.', 400);
+  }
+  return { owner, name, repoUrl: `https://github.com/${owner}/${name}` };
 };
 
-export const fetchRepoDataFromGitHub = async (repoUrl) => {
-    try {
-        const { owner, repoName } = extractRepoDetails(repoUrl);
-
-        // 1. Fetch repository metadata.
-        const repoResponse = await octokit.repos.get({
-            owner,
-            repo: repoName
-        });
-
-        const repository = repoResponse.data;
-
-        if (repository.empty) {
-            throw new ErrorHandler('The GitHub repository is empty.', 400);
-        }
-
-        const defaultBranch = repository.default_branch;
-
-        if (!defaultBranch) {
-            throw new ErrorHandler('Repository default branch not found.', 404);
-        }
-
-        // 2. Fetch recent commit history.
-        const commitsResponse = await octokit.repos.listCommits({
-            owner,
-            repo: repoName,
-            sha: defaultBranch,
-            per_page: 30
-        });
-
-        const commits = commitsResponse.data;
-
-        // 3. Fetch the latest commit SHA.
-        const latestCommitSha = commits[0]?.sha;
-
-        if (!latestCommitSha) {
-            throw new ErrorHandler('No commits found in repository.', 404);
-        }
-
-        // 4. Fetch the complete repository tree.
-        const treeResponse = await octokit.git.getTree({
-            owner,
-            repo: repoName,
-            tree_sha: latestCommitSha,
-            recursive: 'true'
-        });
-
-        const fileTree = treeResponse.data.tree
-            .filter((item) => item.type === 'blob' || item.type === 'tree')
-            .slice(0, MAX_FILES);
-
-        return {
-            owner,
-            repoName,
-
-            repository: {
-                name: repository.name,
-                description: repository.description,
-                defaultBranch,
-                visibility: repository.visibility,
-                language: repository.language,
-                stars: repository.stargazers_count,
-                forks: repository.forks_count,
-                updatedAt: repository.updated_at,
-                htmlUrl: repository.html_url
-            },
-
-            commits: commits.slice(0, MAX_COMMITS),
-
-            fileTree,
-
-            metadata: {
-                totalCommitsFetched: commits.length,
-                totalFilesFetched: fileTree.length,
-                isTreeTruncated: treeResponse.data.truncated,
-                latestCommitSha
-            }
-        };
-
-    } catch (error) {
-        console.error('GitHub API Error:', error.message);
-
-        if (error instanceof ErrorHandler) {
-            throw error;
-        }
-
-        if (error.status === 404) {
-            throw new ErrorHandler(
-                'Repository not found or you do not have access to it.',
-                404
-            );
-        }
-
-        if (error.status === 403 || error.status === 429) {
-            throw new ErrorHandler(
-                'GitHub API rate limit exceeded. Please try again later.',
-                429
-            );
-        }
-
-        throw new ErrorHandler(
-            'Unable to fetch repository data from GitHub.',
-            500
-        );
+const mapGithubError = (err) => {
+  if (err instanceof AppError) return err;
+  const status = err.status;
+  const headers = err.response?.headers || {};
+  if (status === 403 || status === 429) {
+    if (headers['x-ratelimit-remaining'] === '0' || status === 429 || /rate limit/i.test(err.message || '')) {
+      const reset = headers['x-ratelimit-reset']
+        ? ` The limit resets at ${new Date(Number(headers['x-ratelimit-reset']) * 1000).toISOString()}.`
+        : '';
+      return new AppError(`GitHub API rate limit exceeded.${reset} Set GITHUB_TOKEN to raise the limit.`, 429);
     }
+    return new AppError('GitHub denied access. Only public repositories are supported.', 403);
+  }
+  if (status === 404) return new AppError('Repository not found. Check the URL - private repositories are not supported.', 404);
+  if (status === 401) return new AppError('GitHub rejected the configured GITHUB_TOKEN. Check the server configuration.', 502);
+  if (status === 409) return new AppError('This repository is empty - there is nothing to analyze.', 422);
+  return new AppError('Could not fetch data from GitHub. Please try again.', 502);
+};
+
+const fetchReadme = async (gh, owner, repo) => {
+  try {
+    const { data } = await gh.repos.getReadme({ owner, repo, mediaType: { format: 'raw' } });
+    return typeof data === 'string' ? data.slice(0, 8000) : '';
+  } catch {
+    return '';
+  }
+};
+
+export const fetchRepositoryData = async (repoUrl) => {
+  const { owner, name, repoUrl: normalizedUrl } = parseRepoUrl(repoUrl);
+  const gh = getOctokit();
+  try {
+    const { data: repo } = await gh.repos.get({ owner, repo: name });
+    if (repo.private) throw new AppError('Private repositories are not supported in this MVP.', 403);
+
+    const branch = repo.default_branch;
+    const [commits, tree, languages, readme] = await Promise.all([
+      gh.repos.listCommits({ owner, repo: name, sha: branch, per_page: MAX_COMMITS }),
+      gh.git.getTree({ owner, repo: name, tree_sha: branch, recursive: 'true' }),
+      gh.repos.listLanguages({ owner, repo: name }).catch(() => ({ data: {} })),
+      fetchReadme(gh, owner, name),
+    ]);
+
+    const langTotal = Object.values(languages.data).reduce((a, b) => a + b, 0) || 1;
+    return {
+      owner: repo.owner.login,
+      name: repo.name,
+      repoUrl: normalizedUrl,
+      defaultBranch: branch,
+      metadata: {
+        description: repo.description || '',
+        homepage: repo.homepage || '',
+        language: repo.language || '',
+        topics: repo.topics || [],
+        stars: repo.stargazers_count,
+        forks: repo.forks_count,
+        openIssues: repo.open_issues_count,
+        license: repo.license?.spdx_id || '',
+        archived: repo.archived,
+        repoCreatedAt: repo.created_at,
+        pushedAt: repo.pushed_at,
+        languages: Object.entries(languages.data)
+          .map(([n, bytes]) => ({ name: n, percent: Math.round((bytes / langTotal) * 100) }))
+          .sort((a, b) => b.percent - a.percent)
+          .slice(0, 6),
+      },
+      rawCommits: commits.data,
+      rawTree: tree.data.tree || [],
+      treeTruncated: Boolean(tree.data.truncated),
+      readme,
+    };
+  } catch (err) {
+    throw mapGithubError(err);
+  }
+};
+
+// Deterministic facts computed from file names and commit data (no AI involved).
+// These prove a file or folder EXISTS - not that the feature works.
+export const buildSignals = ({ allPaths, cleanPaths, commits, contributorCount, omittedSensitive, treeTruncated }) => ({
+  totalFiles: allPaths.length,
+  analyzedFiles: cleanPaths.length,
+  treeTruncated,
+  sensitiveFilesOmitted: omittedSensitive,
+  hasReadme: cleanPaths.some((p) => /^readme(\.\w+)?$/i.test(p)),
+  hasTests: cleanPaths.some((p) =>
+    /(^|\/)(tests?|__tests__|spec)\//i.test(p) || /\.(test|spec)\.[cm]?[jt]sx?$/i.test(p) || /_test\.(py|go)$/i.test(p)),
+  hasCI: cleanPaths.some((p) => /^\.github\/workflows\//.test(p) || /^(\.gitlab-ci\.yml|Jenkinsfile)$/.test(p) || /^\.circleci\//.test(p)),
+  hasDocker: cleanPaths.some((p) => /(^|\/)(Dockerfile|docker-compose\.ya?ml)$/i.test(p)),
+  hasEnvExample: cleanPaths.some((p) => /(^|\/)\.env\.(example|sample|template)$/i.test(p)),
+  hasLicense: cleanPaths.some((p) => /^(license|licence)(\.\w+)?$/i.test(p)),
+  commitsAnalyzed: commits.length,
+  contributorCount,
+  lastCommitDate: commits[0]?.date || null,
+});
+
+const yn = (v) => (v ? 'found' : 'not found');
+
+export const buildVerifiedFacts = (signals, defaultBranch, pushedAt) => {
+  const facts = [
+    `Default branch is "${defaultBranch}"${pushedAt ? `; last push was ${new Date(pushedAt).toISOString().slice(0, 10)}` : ''}.`,
+    `The repository tree lists ${signals.totalFiles} files; ${signals.analyzedFiles} were analyzed after excluding dependencies, build output, assets and sensitive files${signals.treeTruncated ? ' (GitHub truncated the tree, so this is partial)' : ''}.`,
+    `${signals.commitsAnalyzed} recent commits from ${signals.contributorCount} contributor(s) were analyzed.`,
+    `README: ${yn(signals.hasReadme)}. LICENSE: ${yn(signals.hasLicense)}. .env example file: ${yn(signals.hasEnvExample)}.`,
+    `Test files or folders (by file name): ${yn(signals.hasTests)}. This does not show whether tests pass.`,
+    `CI configuration: ${yn(signals.hasCI)}. Docker files: ${yn(signals.hasDocker)}.`,
+  ];
+  if (signals.sensitiveFilesOmitted > 0) {
+    facts.push(`${signals.sensitiveFilesOmitted} file(s) with sensitive-looking names (such as .env or key files) were excluded from analysis.`);
+  }
+  return facts;
 };
